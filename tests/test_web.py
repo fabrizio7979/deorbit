@@ -1,0 +1,1365 @@
+"""Web UI tests: a real ``Web`` beside a real ``Server``, asked over HTTP the way a browser would."""
+
+import asyncio
+import contextlib
+import json
+import re
+import socket
+import sqlite3
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from unittest import mock
+from urllib.parse import quote
+
+from deorbit import __main__ as cli
+from deorbit import web
+from deorbit.auth import RobotId
+from deorbit.commands import COMMANDS, DAYS, MODES, NAVIGATION_MODES
+from deorbit.config import Config
+from deorbit.server import Server
+from deorbit.web import Web, WebError
+from tests.test_server import Robot, ServerTestCase, signed_login
+from tests.test_store import MAP
+
+STATE = {"state": "idle", "action": "invalid", "errors": None, "details": {"charge": 81, "is_docked": True}}
+# An event of a schedule as the spec has one to add, and the map of a run that is of a floor plan.
+RUN = {"settings": {"mode": "eco", "navigation_mode": "normal"}, "map": None}
+EVENT = {"enabled": True, "days": ["mon", "wed", "fri"], "time": "09:30",
+         "command": {"ability": "cleaning.start", "runs": [RUN]}}
+FLOOR = {"rank_id": "fb7f8145-0615-4a32-8f0d-8d833cd51a5e", "track_id": None, "nogo_enabled": True}
+
+
+class WebTestCase(ServerTestCase):
+    async def start(self, **overrides: object) -> Web:
+        server = await super().start(web_host="127.0.0.1", web_port=0, **overrides)
+        self.web = Web(server)
+        await self.web.start()
+        self.addAsyncCleanup(self.web.stop)
+        return self.web
+
+    async def exchange(self, request: bytes) -> bytes:
+        """Send ``request`` and return everything the server sends before it closes the connection."""
+        reader, writer = await asyncio.open_connection("127.0.0.1", self.web.port)
+        try:
+            writer.write(request)
+            async with asyncio.timeout(5):
+                return await reader.read()
+        finally:
+            writer.close()
+            with contextlib.suppress(OSError):
+                await writer.wait_closed()
+
+    async def fetch(
+        self, target: str, method: str = "GET", sent: tuple[str, ...] = ("Host: localhost",)
+    ) -> tuple[int, dict[str, str], bytes]:
+        """The status, headers and body the server answers ``target`` with, asked with the headers in ``sent``."""
+        answer = await self.exchange("\r\n".join((f"{method} {target} HTTP/1.1", *sent, "", "")).encode())
+        head, _, body = answer.partition(b"\r\n\r\n")
+        status, *lines = head.decode().split("\r\n")
+        return int(status.split()[1]), dict(line.split(": ", 1) for line in lines), body
+
+    def read(self, headers: dict[str, str], body: bytes) -> dict:
+        """The JSON in an answer, read the way a browser would."""
+        self.assertEqual(headers["Content-Type"], "application/json")
+
+        def not_json(token: str) -> None:
+            self.fail(f"{token} is not JSON a browser can read")
+
+        return json.loads(body, parse_constant=not_json)
+
+    async def api(self, target: str) -> dict:
+        status, headers, body = await self.fetch(target)
+        self.assertEqual(status, 200)
+        return self.read(headers, body)
+
+    def assertJustNow(self, stamp: str) -> None:
+        self.assertRegex(stamp, r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z$")
+        self.assertLess(abs(datetime.now(timezone.utc) - datetime.fromisoformat(stamp)), timedelta(seconds=5))
+
+    # What a browser sends with a request from the page this server gave it.
+    PAGE = ("Host: localhost:8080", "Origin: http://localhost:8080")
+
+    async def command(self, target: str, sent: tuple[str, ...] = PAGE) -> tuple[int, dict]:
+        """The status and the JSON that a command is answered with."""
+        status, headers, body = await self.fetch(target, "POST", sent)
+        return status, self.read(headers, body)
+
+    async def answered(self, robot: Robot, target: str, answer: dict, sent: tuple[str, ...] = PAGE) -> tuple[dict, tuple[int, dict]]:
+        """Send a command and have the robot answer it: what the robot was sent, and what the page was told.
+
+        When the command was sent, which the page is told with every answer of a robot, is checked here and left out.
+        """
+        sending = asyncio.create_task(self.command(target, sent))
+        request = await robot.recv()
+        await robot.send({"type": "response", "id": request["id"], **answer})
+        status, told = await sending
+        if status == 200:
+            self.assertJustNow(told.pop("sent"))
+        return request, (status, told)
+
+
+class PageTests(WebTestCase):
+    async def test_page_and_everything_it_loads(self) -> None:
+        await self.start()
+        status, headers, page = await self.fetch("/")
+        self.assertEqual((status, headers["Content-Type"]), (200, "text/html; charset=utf-8"))
+        self.assertEqual(int(headers["Content-Length"]), len(page))
+        loaded = dict.fromkeys(re.findall(r'(?:href|src)="([^"#]+)"', page.decode()))
+        self.assertEqual(list(loaded), ["favicon.svg", "app.css", "app.js"])
+        kinds = {
+            "favicon.svg": "image/svg+xml",
+            "app.css": "text/css; charset=utf-8",
+            "app.js": "text/javascript; charset=utf-8",
+        }
+        for name, kind in kinds.items():
+            with self.subTest(name):
+                status, headers, body = await self.fetch(f"/{name}")
+                self.assertEqual((status, headers["Content-Type"]), (200, kind))
+                self.assertTrue(body)
+        # The script loads the rest of itself from beside it.
+        _, _, script = await self.fetch("/app.js")
+        self.assertEqual(re.findall(r"^import .* from '\./(.+)';$", script.decode(), re.M), ["map.js"])
+        status, headers, body = await self.fetch("/map.js")
+        self.assertEqual((status, headers["Content-Type"]), (200, "text/javascript; charset=utf-8"))
+        self.assertNotIn(b"import ", body)
+
+    async def test_the_add_robot_helpers_are_served(self) -> None:
+        await self.start()
+        for name in ("neato-config.js", "mtp-client.js", "webusb-transport.js"):
+            with self.subTest(name):
+                status, headers, body = await self.fetch(f"/{name}")
+                self.assertEqual((status, headers["Content-Type"]), (200, "text/javascript; charset=utf-8"))
+                self.assertTrue(body)
+
+
+class SetupTests(WebTestCase):
+    async def test_setup_gives_the_address_and_the_ca(self) -> None:
+        await self.start()
+        setup = await self.api("/api/setup")
+        self.assertEqual(setup["address"], "")
+        self.assertEqual(setup["ca"], (self.dir / "certs" / "ca.crt").read_text())
+
+    async def test_setup_gives_the_configured_address(self) -> None:
+        await self.start(public_address="192.168.1.50")
+        self.assertEqual((await self.api("/api/setup"))["address"], "192.168.1.50")
+
+    async def test_setup_without_a_ca(self) -> None:
+        await self.start()
+        ca = self.dir / "certs" / "ca.crt"
+        saved = ca.read_bytes()
+        self.addCleanup(ca.write_bytes, saved)  # the directory is shared by the class's tests
+        ca.unlink()
+        self.assertIsNone((await self.api("/api/setup"))["ca"])
+
+    async def test_nothing_but_the_page_may_run_on_it(self) -> None:
+        await self.start()
+        for target in ("/", "/app.js", "/api/robots", "/nowhere"):
+            with self.subTest(target):
+                _, headers, _ = await self.fetch(target)
+                self.assertIn("script-src 'self'", headers["Content-Security-Policy"])
+                self.assertEqual(headers["X-Content-Type-Options"], "nosniff")
+                self.assertEqual(headers["Cache-Control"], "no-store")
+        # The policy lets neither of these run, so the page must not count on them.
+        _, _, page = await self.fetch("/")
+        self.assertNotRegex(page.decode(), r"<style|style=|<script>|\son\w+=")
+
+    async def test_head_has_no_body(self) -> None:
+        await self.start()
+        _, got, body = await self.fetch("/app.js")
+        status, headers, nothing = await self.fetch("/app.js", "HEAD")
+        self.assertEqual((status, headers, nothing), (200, got, b""))
+        self.assertEqual(int(headers["Content-Length"]), len(body))
+
+    async def test_what_is_not_served(self) -> None:
+        await self.start()
+        for target in ("/index.html", "/static/app.js", "/../deorbit.yml", "/api", "/api/robots/", "/api/robots/n",
+                       "/api/events", "/api/maps", "/api/map/1", "/api/names", "/api/name/"):
+            with self.subTest(target):
+                status, _, _ = await self.fetch(target)
+                self.assertEqual(status, 404)
+        status, headers, _ = await self.fetch("/api/robots", "POST")
+        self.assertEqual((status, headers["Allow"]), (405, "GET, HEAD"))
+
+    async def test_requests_that_are_not_http(self) -> None:
+        await self.start()
+        for request in (b"hello", b"GET /", b"GET / HTTP/2.0", b"GET http://localhost/ HTTP/1.1", b"GET /\xff HTTP/1.1"):
+            with self.subTest(request):
+                self.assertEqual((await self.exchange(request + b"\r\n\r\n"))[:13], b"HTTP/1.1 400 ")
+
+    async def test_request_that_is_too_long(self) -> None:
+        with mock.patch.object(web, "_MAX_HEAD", 256):
+            await self.start()
+        answer = await self.exchange(b"GET / HTTP/1.1\r\nCookie: " + b"x" * 1000 + b"\r\n\r\n")
+        self.assertEqual(answer[:13], b"HTTP/1.1 431 ")
+        self.assertEqual((await self.fetch("/"))[0], 200)
+
+    async def test_connection_closed_without_a_request(self) -> None:
+        await self.start()
+        for request in (b"", b"GET / HT"):
+            with self.subTest(request):
+                reader, writer = await asyncio.open_connection("127.0.0.1", self.web.port)
+                self.addCleanup(writer.close)
+                writer.write(request)
+                writer.write_eof()
+                async with asyncio.timeout(5):
+                    self.assertEqual(await reader.read(), b"")
+
+    async def test_silent_connection_is_dropped(self) -> None:
+        await self.start()
+        with mock.patch.object(web, "_TIMEOUT", 0.1):
+            self.assertEqual(await self.exchange(b"GET / HTTP/1.1\r\n"), b"")
+
+    async def test_stop_drops_open_connections(self) -> None:
+        await self.start()
+        reader, writer = await asyncio.open_connection("127.0.0.1", self.web.port)
+        self.addCleanup(writer.close)
+        writer.write(b"GET / HTTP/1.1\r\n")
+        # Connections are taken in order, so once this one is answered the one above is being waited on.
+        self.assertEqual((await self.fetch("/"))[0], 200)
+        port = self.web.port
+        async with asyncio.timeout(5):
+            await self.web.stop()
+            self.assertEqual(await reader.read(), b"")
+        with self.assertRaises(OSError):
+            await asyncio.open_connection("127.0.0.1", port)
+
+
+class RobotTests(WebTestCase):
+    OTHER = RobotId("n", "board0")
+
+    async def test_no_robots(self) -> None:
+        await self.start()
+        answer = await self.api("/api/robots")
+        self.assertJustNow(answer.pop("now"))
+        self.assertEqual(answer, {"robots": []})
+
+    async def test_robots_in_the_database(self) -> None:
+        await self.start()
+        store = self.server.store
+        store.save_state(self.ROBOT, STATE)
+        store.save_heartbeat(self.ROBOT)
+        store.save_heartbeat(self.OTHER)
+        board0, board1 = (await self.api("/api/robots"))["robots"]
+        self.assertEqual((board0["vendor"], board0["serial"], board0["name"]), ("n", "board0", None))
+        self.assertEqual((board0["state"], board0["charge"], board0["state_at"], board0["session"]), (None,) * 4)
+        self.assertJustNow(board0["heartbeat_at"])
+        self.assertEqual(
+            (board1["serial"], board1["state"], board1["action"], board1["errors"], board1["charge"]),
+            ("board1", "idle", "invalid", None, 81),
+        )
+        # As SQLite reads them out of the state: true as 1, and a field the state lacked as nothing.
+        self.assertEqual((board1["is_docked"], board1["is_charging"]), (1, None))
+        self.assertJustNow(board1["state_at"])
+        self.assertIsNone(board1["session"])
+        # The list leaves the whole state to the robot's own page.
+        self.assertNotIn("state_json", board1)
+
+    async def test_one_robot(self) -> None:
+        await self.start()
+        self.server.store.save_state(self.ROBOT, STATE)
+        for target in ("/api/robot?vendor=n&serial=board1", "/api/robot?serial=BOARD1&vendor=N&more=1"):
+            with self.subTest(target):
+                answer = await self.api(target)
+                self.assertJustNow(answer["now"])
+                robot = answer["robot"]
+                self.assertEqual((robot["vendor"], robot["serial"], robot["charge"]), ("n", "board1", 81))
+                self.assertEqual(json.loads(robot["state_json"]), STATE)
+                self.assertIsNone(robot["session"])
+
+    async def test_robot_that_is_not_in_the_database(self) -> None:
+        await self.start()
+        self.server.store.save_state(self.ROBOT, STATE)
+        for target in ("/api/robot?vendor=n&serial=board2", "/api/robot?serial=board1", "/api/robot", "/api/robot?"):
+            with self.subTest(target):
+                status, headers, body = await self.fetch(target)
+                self.assertEqual((status, headers["Content-Type"]), (404, "application/json"))
+                self.assertEqual(json.loads(body), {"error": "no such robot in the database"})
+
+    async def test_names_a_path_could_not_carry(self) -> None:
+        await self.start()
+        for serial, sent in {"..": "..", "a/b?c#d&e=f": "a%2Fb%3Fc%23d%26e%3Df", "bo ard+1": "bo+ard%2B1",
+                             "caf\u00e9": "caf%C3%A9"}.items():
+            with self.subTest(serial):
+                self.server.store.save_heartbeat(RobotId("n", serial))
+                robot = (await self.api(f"/api/robot?vendor=n&serial={sent}"))["robot"]
+                self.assertEqual(robot["serial"], serial)
+
+    async def test_connected_robot_has_a_session(self) -> None:
+        await self.start()
+        robot, _ = await self.login()
+        await robot.send_bytes(b"\x06")
+        self.assertEqual((await robot.request("firmware.check", {}))["id"], "r1")
+        self.server.store.save_heartbeat(self.OTHER)
+        board0, board1 = (await self.api("/api/robots"))["robots"]
+        self.assertIsNone(board0["session"])
+        session = board1["session"]
+        self.assertEqual((await self.api("/api/robot?vendor=n&serial=board1"))["robot"]["session"], session)
+        self.assertJustNow(session.pop("since"))
+        self.assertEqual(session, {"address": "127.0.0.1", "firmware": "4.5.3-189"})
+
+        robot.writer.transport.abort()
+        async with asyncio.timeout(5):
+            while self.server.sessions:
+                await asyncio.sleep(0.01)
+        self.assertIsNone((await self.api("/api/robots"))["robots"][1]["session"])
+
+    async def test_login_without_a_firmware(self) -> None:
+        await self.start(keys=None)
+        for firmware in ({}, {"firmware": 7}):
+            with self.subTest(firmware):
+                robot = await self.connect()
+                await robot.send({"vendor": "N", "serial": "BOARD1", "datetime": "now", "signature": "x", **firmware})
+                self.assertEqual((await robot.recv())["code"], 200)
+                await robot.send_bytes(b"\x06")
+                self.assertEqual((await robot.request("firmware.check", {}))["id"], "r1")
+                session = (await self.api("/api/robots"))["robots"][0]["session"]
+                self.assertEqual((session["address"], session["firmware"]), ("127.0.0.1", None))
+
+    async def test_number_that_json_cannot_write(self) -> None:
+        await self.start()
+        # A whole number may have any length. SQLite reads one beyond its range out of
+        # the state as infinity, and a browser would refuse the bare word for that.
+        state = {"state": "idle", "details": {"charge": 10 ** 400}}
+        self.server.store.save_state(self.ROBOT, state)
+        self.assertEqual((await self.api("/api/robots"))["robots"][0]["charge"], "inf")
+        robot = (await self.api("/api/robot?vendor=n&serial=board1"))["robot"]
+        self.assertEqual((robot["charge"], robot["state"]), ("inf", "idle"))
+        self.assertEqual(json.loads(robot["state_json"]), state)
+
+    async def test_database_that_cannot_be_read(self) -> None:
+        await self.start()
+        with contextlib.closing(sqlite3.connect(self.server.config.database)) as db:
+            db.execute("DROP TABLE robots")
+        for target in ("/api/robots", "/api/robot?vendor=n&serial=board1"):
+            with self.subTest(target), self.assertLogs("deorbit", "ERROR") as logs:
+                status, headers, body = await self.fetch(target)
+                self.assertEqual((status, headers["Content-Type"]), (503, "application/json"))
+                self.assertEqual(json.loads(body), {"error": "cannot read the database: no such table: robots"})
+                self.assertIn("web UI: cannot read the database", logs.output[0])
+        # The page itself needs no database.
+        self.assertEqual((await self.fetch("/"))[0], 200)
+
+
+class NameTests(WebTestCase):
+    """``POST /api/name``, which is what the field for a name on a robot's page sends."""
+
+    OTHER = RobotId("n", "board0")
+    BOARD1 = "/api/name?vendor=n&serial=board1"
+
+    async def start(self, **overrides: object) -> Web:
+        web = await super().start(**overrides)
+        # A robot is named on its page, which it has once it is in the database. Neither is connected.
+        self.server.store.save_state(self.ROBOT, STATE)
+        self.server.store.save_heartbeat(self.OTHER)
+        return web
+
+    async def names(self) -> list[str | None]:
+        """What board0 and board1 are named, as the list of robots has it."""
+        return [robot["name"] for robot in (await self.api("/api/robots"))["robots"]]
+
+    async def test_robot_has_no_name_until_it_is_given_one(self) -> None:
+        await self.start()
+        self.assertEqual(await self.names(), [None, None])
+        with self.assertLogs("deorbit", "INFO") as logs:
+            self.assertEqual(await self.command(self.BOARD1 + "&name=Rosie"), (200, {"name": "Rosie"}))
+        self.assertIn("[n/board1] named 'Rosie'", logs.output[0])
+        self.assertEqual(await self.names(), [None, "Rosie"])
+        robot = (await self.api("/api/robot?vendor=n&serial=board1"))["robot"]
+        # The name is beside what the robot is and sent, and in the place of none of it.
+        self.assertEqual((robot["name"], robot["serial"], robot["state"]), ("Rosie", "board1", "idle"))
+        # The robot is named as it is in the address of its page, whatever the case, and may share its name.
+        self.assertEqual(await self.command("/api/name?name=Rosie&serial=BOARD0&vendor=N"), (200, {"name": "Rosie"}))
+        self.assertEqual(await self.command(self.BOARD1 + "&name=Dusty"), (200, {"name": "Dusty"}))
+        self.assertEqual(await self.names(), ["Rosie", "Dusty"])
+
+    async def test_name_is_kept_as_one_line_of_text(self) -> None:
+        await self.start()
+        for sent, name in {
+            "++Living%20room+%09%0D%0A+robot%C2%A0": "Living room robot",
+            quote("Caf\u00e9 \U0001f9f9 <b>&amp;\"'"): "Caf\u00e9 \U0001f9f9 <b>&amp;\"'",
+            "x" * web._MAX_NAME: "x" * web._MAX_NAME,
+            # What counts is the name that is kept, in characters.
+            "+" * 40 + quote("\U0001f9f9" * web._MAX_NAME) + "+" * 40: "\U0001f9f9" * web._MAX_NAME,
+        }.items():
+            with self.subTest(sent):
+                self.assertEqual(await self.command(f"{self.BOARD1}&name={sent}"), (200, {"name": name}))
+                self.assertEqual(await self.names(), [None, name])
+
+    async def test_no_name_takes_the_name_away(self) -> None:
+        await self.start()
+        for target in (self.BOARD1, self.BOARD1 + "&name=", self.BOARD1 + "&name=+%20%0A"):
+            with self.subTest(target):
+                await self.command(self.BOARD1 + "&name=Rosie")
+                await self.command("/api/name?vendor=n&serial=board0&name=Dusty")
+                with self.assertLogs("deorbit", "INFO") as logs:
+                    self.assertEqual(await self.command(target), (200, {"name": None}))
+                self.assertIn("[n/board1] goes by its serial again", logs.output[0])
+                self.assertEqual(await self.names(), ["Dusty", None])
+        # A robot that has none has none to lose.
+        self.assertEqual(await self.command(self.BOARD1), (200, {"name": None}))
+
+    async def test_name_that_is_not_taken(self) -> None:
+        await self.start()
+        await self.command(self.BOARD1 + "&name=Rosie")
+        long = (400, {"error": "name must be at most 64 characters"})
+        control = (400, {"error": "name must not hold control characters"})
+        for sent, told in {
+            "x" * (web._MAX_NAME + 1): long,
+            quote("\u00e9" * (web._MAX_NAME + 1)): long,
+            "Ro%00sie": control,
+            "Ro%1Bsie": control,
+            "Rosie%7F": control,
+            "%C2%80Rosie": control,
+        }.items():
+            with self.subTest(sent):
+                self.assertEqual(await self.command(f"{self.BOARD1}&name={sent}"), told)
+                # Refused whichever robot it is for, before the robot is looked for.
+                self.assertEqual(await self.command(f"/api/name?name={sent}"), told)
+        self.assertEqual(await self.names(), [None, "Rosie"])
+
+    async def test_robot_that_is_not_in_the_database(self) -> None:
+        await self.start()
+        self.server.store.add_event(RobotId("n", "board2"), "login")  # logged in, and sent nothing since
+        for target in ("/api/name?vendor=n&serial=board2&name=Rosie", "/api/name?serial=board1&name=Rosie",
+                       "/api/name?name=Rosie", "/api/name", "/api/name?vendor=n&serial=board2"):
+            with self.subTest(target):
+                self.assertEqual(await self.command(target), (404, {"error": "no such robot in the database"}))
+        with contextlib.closing(sqlite3.connect(self.server.config.database)) as db:
+            self.assertEqual(db.execute("SELECT * FROM names").fetchall(), [])
+
+    async def test_name_is_taken_from_the_ui_s_own_page_by_post_alone(self) -> None:
+        await self.start()
+        target = self.BOARD1 + "&name=Rosie"
+        told = (403, {"error": "a command is taken only from this server's own page"})
+        for sent in (("Host: localhost:8080",), ("Host: localhost:8080", "Origin: http://elsewhere.example"), ()):
+            with self.subTest(sent):
+                self.assertEqual(await self.command(target, sent), told)
+        for method in ("GET", "HEAD", "PUT", "DELETE"):
+            with self.subTest(method):
+                status, headers, _ = await self.fetch(target, method, self.PAGE)
+                self.assertEqual((status, headers["Allow"]), (405, "POST"))
+        self.assertEqual(await self.names(), [None, None])
+        self.assertEqual(await self.command(target, ("Host: robots.example", "Origin: https://robots.example")),
+                         (200, {"name": "Rosie"}))
+
+    async def test_connected_robot_is_sent_nothing(self) -> None:
+        await self.start()
+        robot, _ = await self.login()
+        self.assertEqual(await self.command(self.BOARD1 + "&name=Rosie"), (200, {"name": "Rosie"}))
+        # The name is the server's own: the first thing the robot gets is the answer to what it asks next.
+        self.assertEqual((await robot.request("firmware.check", {}))["id"], "r1")
+        board1 = (await self.api("/api/robot?vendor=n&serial=board1"))
+        self.assertEqual(board1["robot"]["name"], "Rosie")
+        # Nor is it something the robot did, so it is not among its events.
+        self.assertEqual([(event["kind"], event["service"]) for event in board1["events"]],
+                         [("request", "firmware.check"), ("login", None)])
+
+    async def test_name_that_cannot_be_saved(self) -> None:
+        await self.start()
+        await self.command(self.BOARD1 + "&name=Rosie")
+        with contextlib.closing(sqlite3.connect(self.server.config.database)) as db:
+            # A file that takes no change to a name, as a full disk would not.
+            for change in ("INSERT", "UPDATE", "DELETE"):
+                db.execute(f"CREATE TRIGGER no_{change} BEFORE {change} ON names BEGIN SELECT RAISE(ABORT, 'full'); END")
+            for target in (self.BOARD1 + "&name=Dusty", self.BOARD1):
+                with self.subTest(target), self.assertLogs("deorbit", "ERROR") as logs:
+                    self.assertEqual(await self.command(target),
+                                     (503, {"error": "the name could not be saved to the database"}))
+                    self.assertIn("[n/board1] not saved to the database: full", logs.output[0])
+            self.assertEqual(await self.names(), [None, "Rosie"])
+            db.execute("DROP TABLE robots")
+        with self.assertLogs("deorbit", "ERROR") as logs:
+            self.assertEqual(await self.command(self.BOARD1 + "&name=Dusty"),
+                             (503, {"error": "cannot read the database: no such table: robots"}))
+        self.assertIn("web UI: cannot read the database", logs.output[0])
+
+    async def test_page_takes_a_name_as_long_as_the_server_does(self) -> None:
+        await self.start()
+        _, _, script = await self.fetch("/app.js")
+        self.assertEqual(int(re.search(r"^const NAME_MAX = (\d+);", script.decode(), re.M)[1]), web._MAX_NAME)
+
+
+class DeleteTests(WebTestCase):
+    """``POST /api/delete``, which is what the second press of Delete on a robot's page sends."""
+
+    OTHER = RobotId("n", "board0")
+    BOARD1 = "/api/delete?vendor=n&serial=board1"
+
+    async def start(self, **overrides: object) -> Web:
+        # Deleting a robot takes its key out of the directory, so each test has one of its own.
+        self.keys = self.registry()
+        web = await super().start(keys=self.keys, **overrides)
+        # Both robots have something in every table, the first map being board1's. Neither is connected.
+        for robot in (self.ROBOT, self.OTHER):
+            self.server.store.save_state(robot, STATE)
+            self.server.store.add_event(robot, "login")
+            self.server.store.save_map(robot, MAP)
+            self.server.store.save_name(robot, "Rosie")
+        return web
+
+    async def serials(self) -> list[str]:
+        """The robots there are, as the list of them has it."""
+        return [robot["serial"] for robot in (await self.api("/api/robots"))["robots"]]
+
+    def held(self) -> list[int]:
+        """How many rows of board1 each table of the database file has."""
+        with contextlib.closing(sqlite3.connect(self.server.config.database)) as db:
+            return [db.execute(f"SELECT count(*) FROM {table} WHERE serial = 'board1'").fetchone()[0]
+                    for table in ("robots", "events", "maps", "names")]
+
+    async def test_robot_is_gone_with_all_it_had(self) -> None:
+        await self.start()
+        self.assertEqual((await self.fetch("/api/map?vendor=n&serial=board1&id=1"))[0], 200)
+        with self.assertLogs("deorbit", "INFO") as logs:
+            # The robot is named as it is in the address of its page, whatever the case.
+            self.assertEqual(await self.command("/api/delete?serial=BOARD1&vendor=N"), (200, {}))
+        self.assertIn("[n/board1] deleted", logs.output[-1])
+        self.assertEqual(await self.serials(), ["board0"])
+        for target in ("/api/robot?vendor=n&serial=board1", "/api/map?vendor=n&serial=board1&id=1"):
+            with self.subTest(target):
+                self.assertEqual((await self.fetch(target))[0], 404)
+        self.assertEqual(self.held(), [0, 0, 0, 0])
+        self.assertEqual(list(self.keys.glob("*/*")), [])
+        # The other robot has all it had.
+        other = await self.api("/api/robot?vendor=n&serial=board0")
+        self.assertEqual((other["robot"]["name"], other["robot"]["state"]), ("Rosie", "idle"))
+        self.assertEqual((len(other["events"]), len(other["maps"])), (1, 1))
+        # A robot is deleted once.
+        self.assertEqual(await self.command(self.BOARD1), (404, {"error": "no such robot in the database"}))
+
+    async def test_connected_robot_is_disconnected(self) -> None:
+        await self.start()
+        robot, _ = await self.login()
+        await robot.send_bytes(b"\x06")
+        self.assertEqual((await robot.request("firmware.check", {}))["id"], "r1")
+        self.assertEqual(await self.command(self.BOARD1), (200, {}))
+        # Without a word: the connection ends, as it does for a robot that a newer login replaced.
+        self.assertEqual(await robot.reader.read(), b"")
+        self.assertEqual(self.server.sessions, {})
+        self.assertEqual(await self.serials(), ["board0"])
+        # Nothing of that connection is left either, and with its key gone the robot does not get another.
+        again = await self.connect()
+        await again.send(signed_login(self.key))
+        self.assertEqual(await again.recv(), {"code": 401})
+        self.assertEqual(self.held(), [0, 0, 0, 0])
+
+    async def test_robot_that_is_not_in_the_database(self) -> None:
+        await self.start()
+        self.server.store.add_event(RobotId("n", "board2"), "login")  # logged in, and sent nothing since
+        self.server.store.delete(self.ROBOT)  # has a key, and no page to be deleted from
+        for target in (self.BOARD1, "/api/delete?vendor=n&serial=board2", "/api/delete?serial=board0", "/api/delete"):
+            with self.subTest(target):
+                self.assertEqual(await self.command(target), (404, {"error": "no such robot in the database"}))
+        # Nothing was deleted for any of them.
+        self.assertEqual(await self.serials(), ["board0"])
+        self.assertEqual([path.name for path in self.keys.glob("*/*")], ["BOARD1.pem"])
+        with contextlib.closing(sqlite3.connect(self.server.config.database)) as db:
+            self.assertEqual(db.execute("SELECT count(*) FROM events WHERE serial = 'board2'").fetchone(), (1,))
+
+    async def test_robot_is_deleted_from_the_ui_s_own_page_by_post_alone(self) -> None:
+        await self.start()
+        told = (403, {"error": "a command is taken only from this server's own page"})
+        for sent in (("Host: localhost:8080",), ("Host: localhost:8080", "Origin: http://elsewhere.example"), ()):
+            with self.subTest(sent):
+                self.assertEqual(await self.command(self.BOARD1, sent), told)
+        for method in ("GET", "HEAD", "PUT", "DELETE"):
+            with self.subTest(method):
+                status, headers, _ = await self.fetch(self.BOARD1, method, self.PAGE)
+                self.assertEqual((status, headers["Allow"]), (405, "POST"))
+        self.assertEqual(await self.serials(), ["board0", "board1"])
+        self.assertEqual(self.held(), [1, 1, 1, 1])
+        self.assertEqual(await self.command(self.BOARD1, ("Host: robots.example", "Origin: https://robots.example")),
+                         (200, {}))
+
+    async def test_robot_that_cannot_be_deleted(self) -> None:
+        await self.start()
+        robot, _ = await self.login()
+        # A directory of keys that lets none go, as one mounted to be read only would not.
+        with mock.patch.object(Path, "unlink", side_effect=PermissionError(13, "Permission denied")):
+            with self.assertLogs("deorbit", "ERROR") as logs:
+                self.assertEqual(await self.command(self.BOARD1),
+                                 (503, {"error": "the robot's key could not be deleted: Permission denied"}))
+        self.assertIn("[n/board1] not deleted: its key could not be removed: [Errno 13] Permission denied", logs.output[0])
+        # Nothing of the robot was touched: it is still connected, and has all it had.
+        self.assertEqual((await robot.request("firmware.check", {}))["id"], "r1")
+        self.assertEqual(self.held(), [1, 3, 1, 1])
+        with contextlib.closing(sqlite3.connect(self.server.config.database)) as db:
+            # A file that lets no map go, as a full disk would not.
+            db.execute("CREATE TRIGGER no_delete BEFORE DELETE ON maps BEGIN SELECT RAISE(ABORT, 'full'); END")
+            with self.assertLogs("deorbit", "ERROR") as logs:
+                self.assertEqual(await self.command(self.BOARD1),
+                                 (503, {"error": "the robot could not be deleted from the database"}))
+            self.assertIn("[n/board1] not deleted from the database: full", logs.output[0])
+            # By then its key was gone and its connection ended, and its rows are all there, with the disconnect.
+            self.assertEqual(await robot.reader.read(), b"")
+            self.assertEqual(list(self.keys.glob("*/*")), [])
+            self.assertEqual(self.held(), [1, 4, 1, 1])
+            # So it still has a page, from which deleting it can be asked again.
+            self.assertEqual(await self.serials(), ["board0", "board1"])
+            db.execute("DROP TRIGGER no_delete")
+        self.assertEqual(await self.command(self.BOARD1), (200, {}))
+        self.assertEqual(self.held(), [0, 0, 0, 0])
+
+
+class EventTests(WebTestCase):
+    """The events that come with a robot from ``/api/robot``."""
+
+    OTHER = RobotId("n", "board0")
+    BOARD1 = "/api/robot?vendor=n&serial=board1"
+
+    async def start(self, **overrides: object) -> Web:
+        web = await super().start(**overrides)
+        # A robot is given only once it is in the database, and an event alone does not put it there.
+        self.server.store.save_heartbeat(self.ROBOT)
+        self.server.store.save_heartbeat(self.OTHER)
+        return web
+
+    def log(self, count: int, robot: RobotId | None = None) -> None:
+        """Add ``count`` notifications, numbered from 1 in the order they are logged."""
+        for n in range(1, count + 1):
+            self.server.store.add_event(robot or self.ROBOT, "request", "robots.notify", {"n": n})
+
+    def numbers(self, answer: dict) -> list[int]:
+        return [json.loads(event["body_json"])["n"] for event in answer["events"]]
+
+    async def test_robot_without_events(self) -> None:
+        await self.start()
+        self.log(2, self.OTHER)
+        answer = await self.api(self.BOARD1)
+        self.assertEqual(set(answer), {"now", "robot", "events", "more", "maps", "more_maps"})
+        self.assertEqual((answer["events"], answer["more"]), ([], False))
+
+    async def test_events_newest_first_as_stored(self) -> None:
+        await self.start()
+        store = self.server.store
+        store.add_event(self.ROBOT, "login", body={"address": "10.0.0.7", "firmware": "1.7.0", "verified": True})
+        store.add_event(self.OTHER, "request", "robots.notify", {"message_code": "bin_full", "payload": None})
+        store.add_event(self.ROBOT, "request", "robots.notify", {"message_code": "fuel_less_than_10", "payload": None})
+        store.add_event(self.ROBOT, "event")
+        for target in (self.BOARD1, "/api/robot?serial=BOARD1&vendor=N"):
+            with self.subTest(target):
+                answer = await self.api(target)
+                self.assertFalse(answer["more"])
+                last, notice, login = answer["events"]
+                self.assertEqual(last, {"id": 4, "at": last["at"], "vendor": "n", "serial": "board1", "kind": "event",
+                                        "service": None, "body_json": None})
+                self.assertJustNow(last["at"])
+                self.assertEqual((notice["id"], notice["kind"], notice["service"]), (3, "request", "robots.notify"))
+                # A body is given as the text the database holds, like the whole state of the robot.
+                self.assertEqual(notice["body_json"], '{"message_code":"fuel_less_than_10","payload":null}')
+                self.assertEqual((login["id"], login["kind"], login["service"]), (1, "login", None))
+                self.assertEqual(json.loads(login["body_json"]),
+                                 {"address": "10.0.0.7", "firmware": "1.7.0", "verified": True})
+        # The other robot has its own, and the list of robots carries none.
+        other = await self.api("/api/robot?vendor=n&serial=board0")
+        self.assertEqual([(event["id"], event["serial"]) for event in other["events"]], [(2, "board0")])
+        self.assertEqual(set(await self.api("/api/robots")), {"now", "robots"})
+
+    async def test_no_more_events_than_asked_for(self) -> None:
+        with mock.patch.multiple(web, _EVENTS=3, _MAX_EVENTS=5):
+            await self.start()
+            self.log(7)
+            self.log(9, self.OTHER)
+            for target, numbers in (
+                (self.BOARD1, [7, 6, 5]),  # as many as are given when no number is asked for
+                (self.BOARD1 + "&events=1", [7]),
+                (self.BOARD1 + "&events=5", [7, 6, 5, 4, 3]),
+            ):
+                with self.subTest(target):
+                    answer = await self.api(target)
+                    self.assertEqual((self.numbers(answer), answer["more"]), (numbers, True))
+            for asked in ("0", "6", "-1", "many", "2.5", "9" * 5000):
+                # Asked of a robot that is there and of one that is not: the number is wrong either way.
+                for target in (f"{self.BOARD1}&events={asked}", f"/api/robot?events={asked}"):
+                    with self.subTest(target):
+                        status, headers, body = await self.fetch(target)
+                        self.assertEqual((status, headers["Content-Type"]), (400, "application/json"))
+                        self.assertEqual(json.loads(body), {"error": "events must be a number from 1 to 5"})
+        answer = await self.api(self.BOARD1 + "&events=7")
+        self.assertEqual((self.numbers(answer), answer["more"]), ([7, 6, 5, 4, 3, 2, 1], False))
+        answer = await self.api(self.BOARD1 + "&events=6")
+        self.assertEqual((self.numbers(answer), answer["more"]), ([7, 6, 5, 4, 3, 2], True))
+
+    async def test_as_many_events_as_the_page_first_asks_for(self) -> None:
+        await self.start()
+        self.log(30)
+        answer = await self.api(self.BOARD1)
+        self.assertEqual((self.numbers(answer), answer["more"]), (list(range(30, 5, -1)), True))
+        # The number in the page's script is the one the server gives when asked for none.
+        _, _, script = await self.fetch("/app.js")
+        self.assertIn(f"const EVENTS_STEP = {len(answer['events'])};", script.decode())
+        self.assertIn(f"const EVENTS_MAX = {web._MAX_EVENTS};", script.decode())
+
+    async def test_what_a_connected_robot_did(self) -> None:
+        await self.start()
+        robot, _ = await self.login()
+        await robot.send({"type": "request", "id": "n1", "to": {"service": "robots.notify"},
+                          "body": {"message_code": "fuel_less_than_10", "payload": None}})
+        self.assertEqual((await robot.request("firmware.check", {"version": "4.5.3"}))["id"], "r1")
+        events = (await self.api(self.BOARD1))["events"]
+        self.assertEqual([(event["kind"], event["service"]) for event in events],
+                         [("request", "firmware.check"), ("request", "robots.notify"), ("login", None)])
+        self.assertEqual(json.loads(events[0]["body_json"]), {"version": "4.5.3"})
+
+    async def test_events_that_cannot_be_read(self) -> None:
+        await self.start()
+        with contextlib.closing(sqlite3.connect(self.server.config.database)) as db:
+            db.execute("DROP TABLE events")
+        with self.assertLogs("deorbit", "ERROR") as logs:
+            status, headers, body = await self.fetch(self.BOARD1)
+        self.assertEqual((status, headers["Content-Type"]), (503, "application/json"))
+        self.assertEqual(json.loads(body), {"error": "cannot read the database: no such table: events"})
+        self.assertIn("web UI: cannot read the database", logs.output[0])
+        # The list of robots needs no events.
+        self.assertEqual((await self.fetch("/api/robots"))[0], 200)
+
+
+class MapTests(WebTestCase):
+    """The maps that come with a robot from ``/api/robot``, and the one that ``/api/map`` gives whole."""
+
+    OTHER = RobotId("n", "board0")
+    BOARD1 = "/api/robot?vendor=n&serial=board1"
+    # A map as its robot's page lists it: without the two binaries.
+    LISTED = {**MAP, "map": {"origin": MAP["map"]["origin"]}}
+
+    async def start(self, **overrides: object) -> Web:
+        web = await super().start(**overrides)
+        # A robot is given only once it is in the database, and a map alone does not put it there.
+        self.server.store.save_heartbeat(self.ROBOT)
+        self.server.store.save_heartbeat(self.OTHER)
+        return web
+
+    def upload(self, count: int, robot: RobotId | None = None) -> None:
+        """Store ``count`` maps, each with its number, from 1, for a ``rank_uuid``."""
+        for n in range(1, count + 1):
+            self.server.store.save_map(robot or self.ROBOT, {**MAP, "rank_uuid": n})
+
+    def numbers(self, answer: dict) -> list[int]:
+        return [json.loads(row["map_json"])["rank_uuid"] for row in answer["maps"]]
+
+    async def test_robot_without_maps(self) -> None:
+        await self.start()
+        self.upload(2, self.OTHER)
+        answer = await self.api(self.BOARD1)
+        self.assertEqual((answer["maps"], answer["more_maps"]), ([], False))
+
+    async def test_maps_newest_first_without_their_binaries(self) -> None:
+        await self.start()
+        store = self.server.store
+        unfinished = {**MAP, "rank_uuid": "second", "cleaning_complete": False}
+        for robot, body in ((self.ROBOT, MAP), (self.OTHER, MAP), (self.ROBOT, unfinished)):
+            store.save_map(robot, body)
+        for target in (self.BOARD1, "/api/robot?serial=BOARD1&vendor=N"):
+            with self.subTest(target):
+                answer = await self.api(target)
+                self.assertFalse(answer["more_maps"])
+                last, first = answer["maps"]
+                self.assertEqual(last, {"id": 3, "at": last["at"], "vendor": "n", "serial": "board1",
+                                        "map_json": last["map_json"]})
+                self.assertJustNow(last["at"])
+                # A map is given as JSON text, like the whole state of the robot, and here without its binaries.
+                self.assertEqual(json.loads(last["map_json"]), {**self.LISTED, "rank_uuid": "second",
+                                                                "cleaning_complete": False})
+                self.assertEqual((first["id"], json.loads(first["map_json"])), (1, self.LISTED))
+                self.assertNotIn("_binary", last["map_json"] + first["map_json"])
+        # The other robot has its own, and the list of robots carries none.
+        other = await self.api("/api/robot?vendor=n&serial=board0")
+        self.assertEqual([(row["id"], row["serial"]) for row in other["maps"]], [(2, "board0")])
+        self.assertEqual(set(await self.api("/api/robots")), {"now", "robots"})
+
+    async def test_no_more_maps_than_asked_for(self) -> None:
+        with mock.patch.multiple(web, _MAPS=3, _MAX_MAPS=5):
+            await self.start()
+            self.upload(7)
+            self.upload(9, self.OTHER)
+            for target, numbers in (
+                (self.BOARD1, [7, 6, 5]),  # as many as are given when no number is asked for
+                (self.BOARD1 + "&maps=1", [7]),
+                (self.BOARD1 + "&maps=5&events=1", [7, 6, 5, 4, 3]),
+            ):
+                with self.subTest(target):
+                    answer = await self.api(target)
+                    self.assertEqual((self.numbers(answer), answer["more_maps"]), (numbers, True))
+            for asked in ("0", "6", "-1", "many", "2.5", "9" * 5000):
+                # Asked of a robot that is there and of one that is not: the number is wrong either way.
+                for target in (f"{self.BOARD1}&maps={asked}", f"/api/robot?maps={asked}"):
+                    with self.subTest(target):
+                        status, headers, body = await self.fetch(target)
+                        self.assertEqual((status, headers["Content-Type"]), (400, "application/json"))
+                        self.assertEqual(json.loads(body), {"error": "maps must be a number from 1 to 5"})
+        answer = await self.api(self.BOARD1 + "&maps=7")
+        self.assertEqual((self.numbers(answer), answer["more_maps"]), ([7, 6, 5, 4, 3, 2, 1], False))
+        answer = await self.api(self.BOARD1 + "&maps=6")
+        self.assertEqual((self.numbers(answer), answer["more_maps"]), ([7, 6, 5, 4, 3, 2], True))
+        # How many events come with them is asked for apart, and neither number changes the other.
+        self.assertEqual((answer["events"], answer["more"]), ([], False))
+
+    async def test_as_many_maps_as_the_page_first_asks_for(self) -> None:
+        await self.start()
+        self.upload(12)
+        answer = await self.api(self.BOARD1)
+        self.assertEqual((self.numbers(answer), answer["more_maps"]), (list(range(12, 2, -1)), True))
+        # The numbers in the page's script are the ones the server gives.
+        _, _, script = await self.fetch("/app.js")
+        self.assertIn(f"const MAPS_STEP = {len(answer['maps'])};", script.decode())
+        self.assertIn(f"const MAPS_MAX = {web._MAX_MAPS};", script.decode())
+
+    async def test_one_map_with_its_binaries(self) -> None:
+        await self.start()
+        self.upload(1, self.OTHER)
+        self.server.store.save_map(self.ROBOT, MAP)
+        for target in ("/api/map?vendor=n&serial=board1&id=2", "/api/map?id=2&serial=BOARD1&vendor=N&events=0"):
+            with self.subTest(target):
+                answer = await self.api(target)
+                self.assertEqual(set(answer), {"map"})
+                row = answer["map"]
+                self.assertEqual(row, {"id": 2, "at": row["at"], "vendor": "n", "serial": "board1",
+                                       "map_json": row["map_json"]})
+                self.assertJustNow(row["at"])
+                # Whole, as the robot sent it: the picture is made of the binaries.
+                self.assertEqual(json.loads(row["map_json"]), MAP)
+
+    async def test_map_that_is_not_in_the_database(self) -> None:
+        await self.start()
+        self.upload(1)
+        self.upload(1, self.OTHER)
+        self.assertEqual((await self.api("/api/map?vendor=n&serial=board1&id=1"))["map"]["id"], 1)
+        for target in (
+            "/api/map?vendor=n&serial=board1&id=2",  # the other robot's
+            "/api/map?vendor=n&serial=board1&id=3",
+            "/api/map?vendor=n&serial=board2&id=1",
+            "/api/map?id=1",
+            "/api/map?vendor=n&serial=board1",
+            "/api/map",
+            # Not the number of any row a table can have.
+            *(f"/api/map?vendor=n&serial=board1&id={asked}" for asked in ("0", "-1", "1.0", "one", "", 2 ** 63, "9" * 5000)),
+        ):
+            with self.subTest(target[:60]):
+                status, headers, body = await self.fetch(target)
+                self.assertEqual((status, headers["Content-Type"]), (404, "application/json"))
+                self.assertEqual(json.loads(body), {"error": "no such map in the database"})
+
+    async def test_map_a_connected_robot_uploaded(self) -> None:
+        await self.start()
+        robot, _ = await self.login()
+        self.assertEqual((await robot.request("maps.create", MAP))["code"], 201)
+        (listed,) = (await self.api(self.BOARD1))["maps"]
+        self.assertEqual(json.loads(listed["map_json"]), self.LISTED)
+        whole = (await self.api(f"/api/map?vendor=n&serial=board1&id={listed['id']}"))["map"]
+        self.assertEqual(json.loads(whole["map_json"]), MAP)
+
+    async def test_maps_that_cannot_be_read(self) -> None:
+        await self.start()
+        with contextlib.closing(sqlite3.connect(self.server.config.database)) as db:
+            db.execute("DROP TABLE maps")
+        for target in (self.BOARD1, "/api/map?vendor=n&serial=board1&id=1"):
+            with self.subTest(target), self.assertLogs("deorbit", "ERROR") as logs:
+                status, headers, body = await self.fetch(target)
+                self.assertEqual((status, headers["Content-Type"]), (503, "application/json"))
+                self.assertEqual(json.loads(body), {"error": "cannot read the database: no such table: maps"})
+                self.assertIn("web UI: cannot read the database", logs.output[0])
+        # The list of robots needs no maps.
+        self.assertEqual((await self.fetch("/api/robots"))[0], 200)
+
+
+class CommandTests(WebTestCase):
+    """``POST /api/command``, which is what a button on a robot's page sends."""
+
+    BOARD1 = "/api/command?vendor=n&serial=board1"
+    PAUSE = BOARD1 + "&command=pause"
+
+    async def test_each_command_invokes_its_ability(self) -> None:
+        await self.start()
+        robot, _ = await self.login()
+        abilities = {
+            "start": "cleaning.start",
+            "pause": "cleaning.pause",
+            "resume": "cleaning.resume",
+            "cancel": "cleaning.cancel",
+            "return_to_base": "navigation.return_to_base",
+        }
+        self.assertEqual(set(abilities), set(COMMANDS))
+        for name, ability in abilities.items():
+            with self.subTest(name):
+                # The robot is named as it is in the address of its page, whatever the case.
+                target = f"/api/command?serial=BOARD1&vendor=N&command={name}"
+                request, told = await self.answered(robot, target, {"code": 200, "body": {}})
+                self.assertEqual(told, (200, {"ability": ability, "code": 200, "body": {}}))
+                # A request with an ID to answer and an object naming the ability: a robot takes nothing else.
+                self.assertEqual(set(request), {"type", "id", "body"})
+                self.assertEqual(request["type"], "request")
+                self.assertRegex(request["id"], r"^[0-9a-f-]{36}$")
+                body = dict(request["body"])
+                self.assertEqual(body.pop("ability"), ability)
+                if name == "start":
+                    # A run as the spec has it: its settings, and a map that is null for a cleaning on no floor plan.
+                    (run,) = body.pop("runs")
+                    self.assertEqual(set(run), {"settings", "map"})
+                    self.assertEqual(set(run["settings"]), {"mode", "navigation_mode"})
+                    self.assertIn(run["settings"]["mode"], ("eco", "turbo", "auto", "max"))
+                    self.assertIn(run["settings"]["navigation_mode"], ("normal", "gentle"))
+                    self.assertIsNone(run["map"])
+                self.assertEqual(body, {})
+
+    async def test_whatever_the_robot_answers_is_passed_on(self) -> None:
+        await self.start()
+        robot, _ = await self.login()
+        refusal = {"errors": {"missing_params": ["runs"]}}
+        for answer, told in (
+            ({"code": 422, "body": refusal}, {"code": 422, "body": refusal}),
+            ({"code": "odd", "body": ["caf\u00e9", 10 ** 400]}, {"code": "odd", "body": ["caf\u00e9", 10 ** 400]}),
+            ({}, {"code": None, "body": None}),
+        ):
+            with self.subTest(answer):
+                # The status says that the robot answered, not what it answered.
+                self.assertEqual((await self.answered(robot, self.PAUSE, answer))[1],
+                                 (200, {"ability": "cleaning.pause", **told}))
+
+    async def test_answer_says_when_the_command_was_sent(self) -> None:
+        await self.start()
+        robot, _ = await self.login()
+
+        async def state_at() -> str:
+            """Have the robot send a state, and return when the server says it arrived."""
+            await asyncio.sleep(0.01)  # times are kept to the millisecond
+            await robot.send({"type": "event", "id": "e1", "to": {"service": "peer.state"}, "body": {"state": "idle"}})
+            self.assertEqual((await robot.request("firmware.check", {}, "last"))["id"], "last")
+            return (await self.api("/api/robot?vendor=n&serial=board1"))["robot"]["state_at"]
+
+        before = await state_at()
+        await asyncio.sleep(0.01)
+        sending = asyncio.create_task(self.command(self.PAUSE))
+        request = await robot.recv()
+        # A state that arrives while the robot still has the command to answer is one that follows it too.
+        during = await state_at()
+        await robot.send({"type": "response", "id": request["id"], "code": 200, "body": {}})
+        status, told = await sending
+        self.assertEqual((status, set(told)), (200, {"ability", "sent", "code", "body"}))
+        # The page holds its buttons back until the robot's state is newer than this, compared as text.
+        self.assertTrue(before < told["sent"] < during < await state_at())
+
+    async def test_answer_with_a_number_that_json_cannot_write(self) -> None:
+        await self.start()
+        robot, _ = await self.login()
+        with self.assertLogs("deorbit", "ERROR"):  # the event log does not take it either
+            _, told = await self.answered(robot, self.PAUSE, {"code": 200, "body": {"area": float("nan")}})
+        self.assertEqual(told, (502, {"error": "the robot's answer holds a number that JSON cannot carry"}))
+
+    async def test_command_and_its_answer_are_among_the_events(self) -> None:
+        await self.start()
+        robot, _ = await self.login()
+        await robot.send_bytes(b"\x06")  # a robot has a page once it is in the database
+        await self.answered(robot, self.BOARD1 + "&command=return_to_base", {"code": 200, "body": {}})
+        answer, call, login = (await self.api("/api/robot?vendor=n&serial=board1"))["events"]
+        self.assertEqual([(event["kind"], event["service"]) for event in (answer, call, login)],
+                         [("response", None), ("call", None), ("login", None)])
+        self.assertEqual(json.loads(call["body_json"]), {"ability": "navigation.return_to_base"})
+        self.assertEqual(json.loads(answer["body_json"]),
+                         {"ability": "navigation.return_to_base", "code": 200, "body": {}})
+
+    async def test_robot_that_is_not_connected(self) -> None:
+        await self.start()
+        self.server.store.save_state(self.ROBOT, STATE)  # in the database, as one that has been here
+        for target in (self.PAUSE, "/api/command?vendor=n&serial=board2&command=pause", "/api/command?command=pause"):
+            with self.subTest(target):
+                self.assertEqual(await self.command(target), (409, {"error": "the robot is not connected"}))
+
+    async def test_command_the_server_does_not_have(self) -> None:
+        await self.start()
+        robot, _ = await self.login()
+        told = (400, {"error": "command must be one of start, pause, resume, cancel, return_to_base"})
+        # Asked of a robot that is there and of one that is not: the command is wrong either way.
+        for robot_named in (self.BOARD1, "/api/command?vendor=n&serial=board2"):
+            for command in ("&command=factory_reset", "&command=cleaning.pause", "&command=PAUSE", "&command=", ""):
+                with self.subTest(robot_named + command):
+                    self.assertEqual(await self.command(robot_named + command), told)
+        # None of those reached the robot: the first thing it is sent is this one.
+        request, _ = await self.answered(robot, self.PAUSE, {"code": 200})
+        self.assertEqual(request["body"], {"ability": "cleaning.pause"})
+
+    async def test_only_this_server_s_own_page_may_send_one(self) -> None:
+        await self.start()
+        robot, _ = await self.login()
+        told = (403, {"error": "a command is taken only from this server's own page"})
+        for sent in (
+            ("Host: localhost:8080",),  # no browser: one always says where a POST comes from
+            ("Origin: http://localhost:8080",),
+            ("Host: localhost:8080", "Origin: http://elsewhere.example"),
+            ("Host: localhost:8080", "Origin: http://localhost:8081"),  # another server on the same machine
+            ("Host: localhost:8080", "Origin: http://localhost"),
+            ("Host: localhost:8080", "Origin: http://localhost:8080.elsewhere.example"),
+            ("Host: localhost:8080", "Origin: null"),  # a page that does not say where it is from
+            ("Host: localhost:8080", "Origin: localhost:8080"),
+            ("Host: localhost:8080", "Origin: file://localhost:8080"),
+            ("Host: localhost:8080", "Origin: http://localhost:8080", "Origin: http://elsewhere.example"),
+            ("Host: elsewhere.example", "Host: localhost:8080", "Origin: http://elsewhere.example"),
+            ("Host:", "Origin: http://"),
+            (),
+        ):
+            with self.subTest(sent):
+                self.assertEqual(await self.command(self.PAUSE, sent), told)
+                # Refused before anything else is looked at.
+                self.assertEqual(await self.command("/api/command", sent), told)
+        # None of those reached the robot: the first thing it is sent is the first of these.
+        for sent in (
+            self.PAGE,
+            ("host: LocalHost:8080", "ORIGIN: HTTP://LOCALHOST:8080"),
+            ("Host: 192.168.1.20:8080", "Origin: http://192.168.1.20:8080"),
+            ("Host: [::1]:8080", "Origin: http://[::1]:8080"),
+            # Behind a proxy that passes on the name it was asked under.
+            ("Host: robots.example", "Origin: https://robots.example", "X-Forwarded-For: 10.0.0.7"),
+        ):
+            with self.subTest(sent):
+                request, (status, _) = await self.answered(robot, self.PAUSE, {"code": 200}, sent)
+                self.assertEqual((request["body"], status), ({"ability": "cleaning.pause"}, 200))
+
+    async def test_command_is_sent_by_post_alone(self) -> None:
+        await self.start()
+        robot, _ = await self.login()
+        for method in ("GET", "HEAD", "PUT", "DELETE"):
+            with self.subTest(method):
+                status, headers, _ = await self.fetch(self.PAUSE, method, self.PAGE)
+                self.assertEqual((status, headers["Allow"]), (405, "POST"))
+        request, _ = await self.answered(robot, self.BOARD1 + "&command=resume", {"code": 200})
+        self.assertEqual(request["body"], {"ability": "cleaning.resume"})
+
+    async def test_robot_that_does_not_answer(self) -> None:
+        await self.start()
+        robot, _ = await self.login()
+        with mock.patch.object(web, "_COMMAND_TIMEOUT", 0.05):
+            self.assertEqual(await self.command(self.PAUSE), (504, {"error": "the robot did not answer within 0.05 s"}))
+        # The robot was sent the command all the same, and is still there for the next.
+        self.assertEqual((await robot.recv())["body"], {"ability": "cleaning.pause"})
+        request, (status, _) = await self.answered(robot, self.BOARD1 + "&command=resume", {"code": 200})
+        self.assertEqual((request["body"], status), ({"ability": "cleaning.resume"}, 200))
+
+    async def test_robot_that_goes_before_it_answers(self) -> None:
+        await self.start()
+        robot, _ = await self.login()
+        sending = asyncio.create_task(self.command(self.PAUSE))
+        await robot.recv()
+        robot.writer.transport.abort()
+        status, told = await sending
+        self.assertEqual(status, 502)
+        self.assertRegex(told["error"], r"^no answer from the robot: session closed: connection ")
+
+    async def test_robot_may_take_longer_than_a_request_may(self) -> None:
+        await self.start()
+        robot, _ = await self.login()
+        # The time a browser has to send its request and to take the answer is not the time a robot has.
+        with mock.patch.object(web, "_TIMEOUT", 0.2):
+            sending = asyncio.create_task(self.command(self.PAUSE))
+            request = await robot.recv()
+            await asyncio.sleep(0.5)
+            await robot.send({"type": "response", "id": request["id"], "code": 200})
+            status, told = await sending
+            self.assertEqual((status, told["code"]), (200, 200))
+
+    async def test_page_has_these_commands_and_waits_longer_than_the_server(self) -> None:
+        await self.start()
+        _, _, script = await self.fetch("/app.js")
+        listed = re.search(r"^const COMMANDS = \[\n(.*?)^\];", script.decode(), re.M | re.S)[1]
+        self.assertEqual(re.findall(r"^  \['(\w+)', ", listed, re.M), list(COMMANDS))
+        patience = int(re.search(r"^const COMMAND_TIMEOUT_MS = (\d+);", script.decode(), re.M)[1])
+        self.assertGreater(patience, web._COMMAND_TIMEOUT * 1000)
+
+
+class ScheduleTests(WebTestCase):
+    """``POST /api/schedule``, which is what the schedule on a robot's page is read and changed through."""
+
+    BOARD1 = "/api/schedule?vendor=n&serial=board1"
+    SHOW = BOARD1 + "&action=show"
+    DONE = {"code": 200, "body": {}}
+
+    def change(self, action: str, event: object, robot: str = BOARD1) -> str:
+        """The address that asks for ``event``, or whatever is given for one, to be added or put in place of another."""
+        text = event if isinstance(event, str) else json.dumps(event)
+        return f"{robot}&action={action}&event={quote(text, safe='')}"
+
+    async def test_show_asks_the_robot_for_its_schedule(self) -> None:
+        await self.start()
+        robot, _ = await self.login()
+        # As the spec has a robot give it: an event has its id, and its command two fields that no update takes.
+        command = {**EVENT["command"], "auto_localization": False, "force_floorplan": False}
+        schedule = {"enabled": True, "events": [{"id": "1", **EVENT, "command": command}]}
+        # The robot is named as it is in the address of its page, whatever the case.
+        target = "/api/schedule?serial=BOARD1&vendor=N&action=show"
+        request, told = await self.answered(robot, target, {"code": 200, "body": schedule})
+        self.assertEqual(told, (200, {"ability": "scheduling.show", "code": 200, "body": schedule}))
+        self.assertEqual(set(request), {"type", "id", "body"})
+        self.assertEqual((request["type"], request["body"]), ("request", {"ability": "scheduling.show"}))
+
+    async def test_add_sends_a_new_event(self) -> None:
+        await self.start()
+        robot, _ = await self.login()
+        request, told = await self.answered(robot, self.change("add", EVENT), self.DONE)
+        self.assertEqual(told, (200, {"ability": "scheduling.add", "code": 200, "body": {}}))
+        # Without an id, which is the robot's to give.
+        self.assertEqual(request["body"], {"ability": "scheduling.add", "event": EVENT})
+
+    async def test_update_sends_an_event_under_its_id(self) -> None:
+        await self.start()
+        robot, _ = await self.login()
+        zones = [{"settings": {"mode": mode, "navigation_mode": "gentle"}, "map": {**FLOOR, "track_id": track}}
+                 for mode, track in (("turbo", "888aa432"), ("auto", "999bb543"))]
+        whole = {"settings": {"mode": "max", "navigation_mode": "normal"}, "map": {**FLOOR, "nogo_enabled": False}}
+        for event in (
+            {"id": "1", **EVENT, "enabled": False},
+            {"id": "007", **EVENT, "time": "00:00", "days": list(DAYS)},
+            {"id": "12", **EVENT, "time": "23:59", "command": {"ability": "cleaning.start", "runs": zones}},
+            {"id": "3", **EVENT, "days": ["sun"], "command": {"ability": "cleaning.start", "runs": [whole]}},
+        ):
+            with self.subTest(event):
+                request, told = await self.answered(robot, self.change("update", event), self.DONE)
+                self.assertEqual(told, (200, {"ability": "scheduling.update", "code": 200, "body": {}}))
+                self.assertEqual(request["body"], {"ability": "scheduling.update", "event": event})
+
+    async def test_days_are_sent_in_the_order_of_the_week(self) -> None:
+        await self.start()
+        robot, _ = await self.login()
+        asked = self.change("add", {**EVENT, "days": ["sun", "tue", "mon", "sun"]})
+        request, _ = await self.answered(robot, asked, self.DONE)
+        self.assertEqual(request["body"]["event"]["days"], ["mon", "tue", "sun"])
+
+    async def test_delete_names_the_event(self) -> None:
+        await self.start()
+        robot, _ = await self.login()
+        # An event that comes with it is not looked at.
+        request, told = await self.answered(robot, self.BOARD1 + "&action=delete&id=12&event=nonsense", self.DONE)
+        self.assertEqual(told, (200, {"ability": "scheduling.delete", "code": 200, "body": {}}))
+        self.assertEqual(request["body"], {"ability": "scheduling.delete", "id": "12"})
+
+    async def test_whatever_the_robot_answers_is_passed_on(self) -> None:
+        await self.start()
+        robot, _ = await self.login()
+        # A robot answers 500 to an event it will not have, and says no more.
+        _, told = await self.answered(robot, self.change("add", EVENT), {"code": 500, "body": {}})
+        self.assertEqual(told, (200, {"ability": "scheduling.add", "code": 500, "body": {}}))
+        _, told = await self.answered(robot, self.SHOW, {"code": 200, "body": ["caf\u00e9", None]})
+        self.assertEqual(told, (200, {"ability": "scheduling.show", "code": 200, "body": ["caf\u00e9", None]}))
+
+    async def test_what_is_not_sent_to_a_robot(self) -> None:
+        await self.start()
+        robot, _ = await self.login()
+
+        def event(**changes: object) -> dict:
+            return {**EVENT, **changes}
+
+        def command(**changes: object) -> dict:
+            return event(command={**EVENT["command"], **changes})
+
+        def run(**changes: object) -> dict:
+            return command(runs=[{**RUN, **changes}])
+
+        def settings(**changes: object) -> dict:
+            return run(settings={**RUN["settings"], **changes})
+
+        def floor(**changes: object) -> dict:
+            return run(map={**FLOOR, **changes})
+
+        def less(given: dict, name: str) -> dict:
+            return {key: value for key, value in given.items() if key != name}
+
+        new = "event must be an object of enabled, days, time, command and nothing else"
+        known = "event must be an object of id, enabled, days, time, command and nothing else"
+        days = "event.days must be a list of one or more of mon, tue, wed, thu, fri, sat, sun"
+        time = "event.time must be a time from 00:00 to 23:59"
+        a_run = "event.command.runs[0] must be an object of settings, map and nothing else"
+        a_map = "event.command.runs[0].map, unless null, must be an object of rank_id, track_id, nogo_enabled and nothing else"
+        refused = {
+            "action must be one of show, add, update, delete": [
+                self.BOARD1, *(f"{self.BOARD1}&action={action}&id=1&event={quote(json.dumps(EVENT))}"
+                               for action in ("", "SHOW", "scheduling.show", "remove", "show%20")),
+            ],
+            # The last two are a digit that is not one of the ten, and a 1 with the end of a line after it.
+            "id must be a string of digits": [
+                f"{self.BOARD1}&action=delete{given}"
+                for given in ("", "&id=", "&id=one", "&id=1.5", "&id=-1", "&id=%201", "&id=%D9%A1", "&id=1%0A")
+            ],
+            "event must be JSON": [
+                self.BOARD1 + "&action=add",
+                *(self.change(action, text) for action in ("add", "update")
+                  for text in ("", "nonsense", "{'enabled': true}", json.dumps(EVENT)[:-1], "[" * 5000)),
+            ],
+            new: [self.change("add", given) for given in (
+                None, '"event"', 7, [EVENT], {}, {"id": "1", **EVENT}, {**EVENT, "name": "x"}, *(less(EVENT, name) for name in EVENT),
+            )],
+            known: [self.change("update", given) for given in (EVENT, None, {"id": "1", **EVENT, "name": "x"}, {"id": "1"})],
+            "event.id must be a string of digits": [
+                self.change("update", {"id": given, **EVENT}) for given in (1, "", "one", "1 ", "-1", None, ["1"])
+            ],
+            "event.enabled must be true or false": [self.change("add", event(enabled=given)) for given in (1, 0, "true", None)],
+            days: [self.change("add", event(days=given))
+                   for given in ([], "mon", ["monday"], ["Mon"], ["mon", 1], [["mon"]], {"mon": True}, None)],
+            time: [self.change("add", event(time=given))
+                   for given in ("9:30", "24:00", "09:60", "09:30:00", "0930", "09:30\n", " 09:30", "", 930, None)],
+            "event.command must be an object of ability, runs and nothing else": [
+                self.change("add", given)
+                for given in (event(command=None), event(command=[]), command(force_floorplan=False), event(command={"runs": [RUN]}))
+            ],
+            "event.command.ability must be cleaning.start": [
+                self.change("add", command(ability=given)) for given in ("cleaning.pause", "CLEANING.START", None, ["cleaning.start"])
+            ],
+            "event.command.runs must be a list of one or more runs": [
+                self.change("add", command(runs=given)) for given in ([], None, RUN, "runs")
+            ],
+            a_run: [self.change("add", command(runs=[given]))
+                    for given in (None, [], {"settings": RUN["settings"]}, {**RUN, "track_id": None})],
+            "event.command.runs[1] must be an object of settings, map and nothing else": [
+                self.change("add", command(runs=[{**RUN, "map": FLOOR}, None])),
+            ],
+            "event.command.runs[0].settings must be an object of mode, navigation_mode and nothing else": [
+                self.change("add", run(settings=given)) for given in (None, {"mode": "eco"}, {**RUN["settings"], "passes": 2})
+            ],
+            "event.command.runs[0].settings.mode must be one of eco, turbo, auto, max": [
+                self.change("add", settings(mode=given)) for given in ("deep", "ECO", "", None, 1, ["eco"])
+            ],
+            "event.command.runs[0].settings.navigation_mode must be one of normal, gentle": [
+                self.change("add", settings(navigation_mode=given)) for given in ("fast", "", None, True)
+            ],
+            a_map: [self.change("add", run(map=given))
+                    for given in ({}, False, "fb7f8145", [FLOOR], less(FLOOR, "track_id"), {**FLOOR, "name": "x"})],
+            "event.command.runs[0].map.rank_id must be a string that is not empty": [
+                self.change("add", floor(rank_id=given)) for given in ("", None, 7)
+            ],
+            "event.command.runs[0].map.track_id must be null or a string that is not empty": [
+                self.change("add", floor(track_id=given)) for given in ("", 7, False)
+            ],
+            "event.command.runs[0].map.nogo_enabled must be true or false": [
+                self.change("add", floor(nogo_enabled=given)) for given in ("yes", 1, None)
+            ],
+            # More runs than one are the zones of one floor plan.
+            "event.command.runs, when more than one, must each have a map of the same rank_id": [
+                self.change("add", command(runs=given)) for given in (
+                    [RUN, RUN], [{**RUN, "map": FLOOR}, RUN], [{**RUN, "map": FLOOR}, {**RUN, "map": {**FLOOR, "rank_id": "another"}}],
+                )
+            ],
+        }
+        for error, targets in refused.items():
+            for target in targets:
+                # Asked of a robot that is there and of one that is not: the request is wrong either way.
+                for asked in (target, target.replace("serial=board1", "serial=board2")):
+                    with self.subTest(error=error, target=asked[:200]):
+                        self.assertEqual(await self.command(asked), (400, {"error": error}))
+        # None of those reached the robot: the first thing it is sent is this one.
+        request, _ = await self.answered(robot, self.SHOW, self.DONE)
+        self.assertEqual(request["body"], {"ability": "scheduling.show"})
+
+    async def test_robot_that_is_not_connected(self) -> None:
+        await self.start()
+        self.server.store.save_state(self.ROBOT, STATE)  # in the database, as one that has been here
+        for target in (self.SHOW, self.change("add", EVENT), self.BOARD1 + "&action=delete&id=1",
+                       "/api/schedule?vendor=n&serial=board2&action=show", "/api/schedule?action=show"):
+            with self.subTest(target):
+                self.assertEqual(await self.command(target), (409, {"error": "the robot is not connected"}))
+
+    async def test_only_this_server_s_own_page_may_ask(self) -> None:
+        await self.start()
+        robot, _ = await self.login()
+        told = (403, {"error": "a command is taken only from this server's own page"})
+        for sent in (("Host: localhost:8080",), ("Host: localhost:8080", "Origin: http://elsewhere.example"), ()):
+            # Reading the schedule is asked of the robot too, so that is refused like a change to it.
+            for target in (self.SHOW, self.change("add", EVENT), "/api/schedule"):
+                with self.subTest(sent=sent, target=target):
+                    self.assertEqual(await self.command(target, sent), told)
+        for method in ("GET", "HEAD", "PUT", "DELETE"):
+            with self.subTest(method):
+                status, headers, _ = await self.fetch(self.SHOW, method, self.PAGE)
+                self.assertEqual((status, headers["Allow"]), (405, "POST"))
+        # None of those reached the robot: the first thing it is sent is this one.
+        request, _ = await self.answered(robot, self.BOARD1 + "&action=delete&id=4", self.DONE)
+        self.assertEqual(request["body"], {"ability": "scheduling.delete", "id": "4"})
+
+    async def test_robot_that_does_not_answer(self) -> None:
+        await self.start()
+        robot, _ = await self.login()
+        with mock.patch.object(web, "_COMMAND_TIMEOUT", 0.05):
+            self.assertEqual(await self.command(self.SHOW), (504, {"error": "the robot did not answer within 0.05 s"}))
+        self.assertEqual((await robot.recv())["body"], {"ability": "scheduling.show"})
+        sending = asyncio.create_task(self.command(self.SHOW))
+        await robot.recv()
+        robot.writer.transport.abort()
+        status, told = await sending
+        self.assertEqual(status, 502)
+        self.assertRegex(told["error"], r"^no answer from the robot: session closed: connection ")
+
+    async def test_change_and_its_answer_are_among_the_events(self) -> None:
+        await self.start()
+        robot, _ = await self.login()
+        await robot.send_bytes(b"\x06")  # a robot has a page once it is in the database
+        await self.answered(robot, self.change("update", {"id": "2", **EVENT}), self.DONE)
+        answer, call, login = (await self.api("/api/robot?vendor=n&serial=board1"))["events"]
+        self.assertEqual([(event["kind"], event["service"]) for event in (answer, call, login)],
+                         [("response", None), ("call", None), ("login", None)])
+        self.assertEqual(json.loads(call["body_json"]), {"ability": "scheduling.update", "event": {"id": "2", **EVENT}})
+        self.assertEqual(json.loads(answer["body_json"]), {"ability": "scheduling.update", "code": 200, "body": {}})
+
+    async def test_page_offers_what_the_server_takes(self) -> None:
+        await self.start()
+        _, _, script = await self.fetch("/app.js")
+        listed = re.search(r"^const DAYS = \[\n(.*?)^\];", script.decode(), re.M | re.S)[1]
+        self.assertEqual(re.findall(r"^  \['(\w+)', ", listed, re.M), list(DAYS))
+        self.assertIn(f"const MODES = {list(MODES)};", script.decode())
+        self.assertIn(f"const NAVIGATION_MODES = {list(NAVIGATION_MODES)};", script.decode())
+
+
+class ServeTests(ServerTestCase):
+    """``_serve``, which is what ``main`` runs: the robots' listener and the web UI together."""
+
+    def config(self, **overrides: object) -> Config:
+        settings = {"web_host": "127.0.0.1", "web_port": 0, **overrides}
+        return Config(
+            cert=self.dir / "certs" / "server.crt",
+            key=self.dir / "certs" / "server.key",
+            host="127.0.0.1",
+            port=0,
+            database=self.dir / "db" / f"{self.id()}.db",
+            **settings,
+        )
+
+    def taken(self) -> int:
+        """A port that something else is listening on."""
+        listener = socket.create_server(("127.0.0.1", 0))
+        self.addCleanup(listener.close)
+        return listener.getsockname()[1]
+
+    async def serve(self, config: Config, until: str, then: object = None) -> list[str]:
+        """Run ``_serve`` until it logs ``until``, await ``then`` with that line, and return every line logged."""
+        with self.assertLogs("deorbit", "INFO") as logs:
+            serving = asyncio.create_task(cli._serve(config))
+            try:
+                async with asyncio.timeout(5):
+                    while not any(until in line for line in logs.output):
+                        await asyncio.sleep(0.01)
+                if then is not None:
+                    await then(logs.output[-1])
+            finally:
+                serving.cancel()
+                await asyncio.gather(serving, return_exceptions=True)
+        return logs.output
+
+    async def test_both_listeners_until_cancelled(self) -> None:
+        async def ask(line: str) -> None:
+            self.assertRegex(line, r"web UI on http://127\.0\.0\.1:\d+, open to anyone who can reach it$")
+            self.port = int(re.search(r":(\d+),", line)[1])
+            reader, writer = await asyncio.open_connection("127.0.0.1", self.port)
+            self.addCleanup(writer.close)
+            writer.write(b"GET /api/robots HTTP/1.1\r\n\r\n")
+            self.assertIn(b'"robots":[]', await reader.read())
+
+        await self.serve(self.config(), "web UI on", ask)
+        with self.assertRaises(OSError):
+            await asyncio.open_connection("127.0.0.1", self.port)
+
+    async def test_web_ui_turned_off(self) -> None:
+        # With the UI off, its port is not even tried.
+        lines = await self.serve(self.config(web=False, web_port=self.taken()), "listening on")
+        self.assertNotIn("web UI", "".join(lines))
+
+    async def test_web_port_in_use(self) -> None:
+        config = self.config(web_port=self.taken())
+        with mock.patch.object(Server, "stop", autospec=True, side_effect=Server.stop) as stop:
+            with self.assertRaisesRegex(WebError, rf"^cannot serve the web UI on 127\.0\.0\.1:{config.web_port}: \w+"):
+                await cli._serve(config)
+        # The robots' listener and the database, opened first, were closed again.
+        stop.assert_awaited_once()

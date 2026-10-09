@@ -1,0 +1,21 @@
+services:
+  deorbit:
+    build: .
+    image: deorbit
+    restart: unless-stopped
+    ports:
+      - "3443:3443"  # the container side must match `port` in deorbit.yml
+      # The web UI, which has no login; the container side must match `web_port`.
+      # Write "127.0.0.1:8080:8080" to offer it to this machine only.
+      - "8080:8080"
+    volumes:
+      - ./deorbit.yml:/data/deorbit.yml:ro
+      # Writable: with `generate_certs` on, the first start creates the CA and
+      # the server certificate here, and later starts reuse them.
+      - ./certs:/data/certs
+      # The directory of `database` in deorbit.yml, so that what the server
+      # remembers about each robot outlasts the container.
+      - ./data:/data/data
+      # For `keys: keys` in deorbit.yml. Deleting a robot in the web UI removes
+      # its key, so mounted read-only, a robot that has one cannot be deleted.
+      # - ./keys:/data/keys:ro

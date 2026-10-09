@@ -1,0 +1,5 @@
+# Only what the Dockerfile copies; private keys in certs/ never reach the build.
+*
+!pyproject.toml
+!deorbit
+**/__pycache__

@@ -1,0 +1,375 @@
+"""Web UI: a plain HTTP listener that shows the robots in the database with their events and maps, names a robot, sends it commands, reads and changes its schedule, and deletes it."""
+
+import asyncio
+import json
+import logging
+import math
+import socket
+import unicodedata
+from http import HTTPStatus
+from importlib import resources
+from typing import TYPE_CHECKING
+from urllib.parse import parse_qs
+
+from .auth import RobotId
+from .commands import COMMANDS, scheduling
+from .session import describe
+from .store import StoreError, now
+
+if TYPE_CHECKING:
+    from .server import Server
+
+log = logging.getLogger(__name__)
+
+# What a browser loads, by request path: the file in static/ and its content
+# type. The files are read once at startup, so no file name is ever built from
+# a request.
+_PAGES = {
+    "/": ("index.html", "text/html; charset=utf-8"),
+    "/app.css": ("app.css", "text/css; charset=utf-8"),
+    "/app.js": ("app.js", "text/javascript; charset=utf-8"),
+    "/map.js": ("map.js", "text/javascript; charset=utf-8"),
+    "/favicon.svg": ("favicon.svg", "image/svg+xml"),
+    # The browser-side helpers that "Bind a robot" loads to talk to a robot over WebUSB.
+    "/neato-config.js": ("neato-config.js", "text/javascript; charset=utf-8"),
+    "/mtp-client.js": ("mtp-client.js", "text/javascript; charset=utf-8"),
+    "/webusb-transport.js": ("webusb-transport.js", "text/javascript; charset=utf-8"),
+    "/mtp-fs.js": ("mtp-fs.js", "text/javascript; charset=utf-8"),
+}
+_JSON = "application/json"
+_TEXT = "text/plain; charset=utf-8"
+
+# How long a connection has to send its request, and then to take the response.
+_TIMEOUT = 10.0
+# How long a robot has to answer a command. The page waits a little longer for
+# the answer to its request.
+_COMMAND_TIMEOUT = 10.0
+# The longest request line and headers read. A browser sends every cookie it
+# holds for the host, whichever port set it, so this is not kept tight.
+_MAX_HEAD = 64 * 1024
+
+# How many of its latest events come with a robot when the request names no
+# number, and the most that do.
+_EVENTS = 25
+_MAX_EVENTS = 1000
+# The same for its maps. Each comes without its binaries, but is read whole to
+# leave them out, so these are kept lower.
+_MAPS = 10
+_MAX_MAPS = 100
+# The largest number a row of a table can have, which is the most the ``id`` of a map can be.
+_MAX_ID = 2**63 - 1
+# The most characters the name given to a robot may have.
+_MAX_NAME = 64
+
+# Sent with every response. Each connection carries one request. Nothing is
+# cached, so a state on screen is never a stale one and an upgraded server is
+# never shown through the old page. The page shows text that robots sent: it
+# adds that as text, and the policy keeps it from running even if it did not.
+_HEADERS = (
+    "Connection: close\r\n"
+    "Cache-Control: no-store\r\n"
+    "X-Content-Type-Options: nosniff\r\n"
+    "Content-Security-Policy: default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; "
+    "connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'\r\n"
+)
+
+
+class WebError(Exception):
+    """The web UI cannot listen on its address."""
+
+
+def _finite(value: object) -> object:
+    """``value``, or its text when it is an infinity, which SQLite reads out of a number beyond its range and JSON cannot write."""
+    return str(value) if isinstance(value, float) and not math.isfinite(value) else value
+
+
+def _json(value: object) -> bytes:
+    return json.dumps(value, separators=(",", ":"), allow_nan=False).encode()
+
+
+def _named(asked: dict[str, list[str]]) -> RobotId:
+    """The robot a query names, which is none in the database when it names none."""
+    # In the query, not the path: a vendor or serial may hold "/" or be "..",
+    # which a browser would not leave in a path.
+    return RobotId(*(asked.get(name, [""])[0].lower() for name in ("vendor", "serial")))
+
+
+def _number(asked: dict[str, list[str]], name: str, most: int, default: int | None = None) -> int | None:
+    """The number from 1 to ``most`` that a query gives as ``name``, or ``None`` when what it gives is not one."""
+    try:
+        number = int(asked.get(name, [default])[0])
+    except (TypeError, ValueError):  # no number at all and no default, or not a number
+        return None
+    return number if 1 <= number <= most else None
+
+
+def _name(asked: dict[str, list[str]]) -> str | None:
+    """The name a query gives a robot, as it is kept, or ``None`` when it gives none; one that is refused is a ``ValueError`` that says why."""
+    # A name is one line: whatever white space it came with, its words end up a space apart.
+    name = " ".join(asked.get("name", [""])[0].split())
+    if len(name) > _MAX_NAME:
+        raise ValueError(f"name must be at most {_MAX_NAME} characters")
+    if any(unicodedata.category(character) == "Cc" for character in name):
+        raise ValueError("name must not hold control characters")
+    return name or None
+
+
+def _response(status: int, kind: str, body: bytes, *, extra: str = "", bodiless: bool = False) -> bytes:
+    head = (
+        f"HTTP/1.1 {status} {HTTPStatus(status).phrase}\r\n"
+        f"Content-Type: {kind}\r\n"
+        f"Content-Length: {len(body)}\r\n"
+        f"{_HEADERS}{extra}\r\n"
+    )
+    return head.encode("ascii") + (b"" if bodiless else body)
+
+
+def _refusal(status: int, extra: str = "") -> bytes:
+    return _response(status, _TEXT, f"{HTTPStatus(status).phrase}\n".encode(), extra=extra)
+
+
+def _own_page(head: bytes) -> bool:
+    """Whether a request comes from a page that this server served.
+
+    A browser names the site a request comes from in ``Origin``, and for the
+    UI's own page that is the host the request was sent to. A request from any
+    other site fails this, and so does one that names no origin at all.
+    """
+    said: dict[str, list[str]] = {}
+    for line in head.decode("latin-1").split("\r\n")[1:]:
+        name, _, value = line.partition(":")
+        said.setdefault(name.lower(), []).append(value.strip().lower())
+    hosts, origins = said.get("host", []), said.get("origin", [])
+    if len(hosts) != 1 or len(origins) != 1:
+        return False
+    scheme, _, origin = origins[0].partition("://")
+    return scheme in ("http", "https") and hosts[0] != "" and origin == hosts[0]
+
+
+class Web:
+    def __init__(self, server: "Server") -> None:
+        self._config = server.config
+        self._store = server.store
+        self._sessions = server.sessions
+        self._delete_robot = server.delete
+        static = resources.files(__package__) / "static"
+        self._pages = {path: (kind, (static / name).read_bytes()) for path, (name, kind) in _PAGES.items()}
+        # What is sent on to a robot, and what changes the database. Reading a
+        # schedule is the first of those, so that is no GET either.
+        self._posts = {
+            "/api/command": self._command,
+            "/api/schedule": self._schedule,
+            "/api/name": self._rename,
+            "/api/delete": self._delete,
+        }
+        self._listener: asyncio.Server | None = None
+        self._connections: set[asyncio.Task] = set()
+
+    @property
+    def port(self) -> int:
+        return self._listener.sockets[0].getsockname()[1]
+
+    async def start(self) -> None:
+        host, port = self._config.web_host, self._config.web_port
+        try:
+            listener = socket.create_server((host, port))
+        except OSError as exc:
+            raise WebError(f"cannot serve the web UI on {host}:{port}: {exc.strerror or exc}") from exc
+        self._listener = await asyncio.start_server(self._handle, sock=listener, limit=_MAX_HEAD)
+        log.info("web UI on http://%s:%d, open to anyone who can reach it", host, self.port)
+
+    async def stop(self) -> None:
+        if self._listener is None:
+            return
+        self._listener.close()
+        for task in self._connections:
+            task.cancel()
+        await asyncio.gather(*self._connections, return_exceptions=True)
+
+    async def _handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        task = asyncio.current_task()
+        self._connections.add(task)
+        try:
+            # Not under a timeout as a whole: a command waits for its robot, which has a limit of its own.
+            answer = await self._respond(reader)
+            async with asyncio.timeout(_TIMEOUT):
+                writer.write(answer)
+                writer.close()  # once what was just written has gone out
+                await writer.wait_closed()
+        except (TimeoutError, OSError):
+            pass  # a browser that stalls or goes away is nothing to report
+        finally:
+            self._connections.discard(task)
+            writer.transport.abort()
+
+    async def _respond(self, reader: asyncio.StreamReader) -> bytes:
+        """Read one request and return the whole response to it."""
+        try:
+            async with asyncio.timeout(_TIMEOUT):
+                head = await reader.readuntil(b"\r\n\r\n")
+        except asyncio.IncompleteReadError:
+            return b""  # closed without asking, as a browser does with a connection it opened in advance
+        except asyncio.LimitOverrunError:
+            return _refusal(431)
+        try:
+            method, target, version = head.split(b"\r\n", 1)[0].decode("ascii").split(" ")
+        except ValueError:  # not three parts, or not ASCII
+            return _refusal(400)
+        if not version.startswith("HTTP/1.") or not target.startswith("/"):
+            return _refusal(400)
+        path, _, query = target.partition("?")
+        try:
+            if path in self._posts:
+                if method != "POST":
+                    return _refusal(405, "Allow: POST\r\n")
+                # The UI has no login, so this is all that keeps another site, open in the
+                # same browser, from commanding, naming or deleting a robot through it.
+                if not _own_page(head):
+                    return _response(403, _JSON, _json({"error": "a command is taken only from this server's own page"}))
+                status, kind, body = await self._posts[path](query)
+            elif method not in ("GET", "HEAD"):
+                return _refusal(405, "Allow: GET, HEAD\r\n")
+            else:
+                status, kind, body = self._route(path, query)
+        except StoreError as exc:
+            log.error("web UI: %s", exc)
+            status, kind, body = 503, _JSON, _json({"error": str(exc)})
+        return _response(status, kind, body, bodiless=method == "HEAD")
+
+    def _route(self, path: str, query: str) -> tuple[int, str, bytes]:
+        if path in self._pages:
+            return 200, *self._pages[path]
+        if path == "/api/setup":
+            # What "Bind a robot" needs to point a robot at this server: the address
+            # to write into its hosts file, and the CA it must trust. Both are
+            # public; the CA private key beside the cert is never read here.
+            return 200, _JSON, _json({"address": self._config.public_address, "ca": self._ca()})
+        if path == "/api/robots":
+            robots = [self._robot(row) for row in self._store.robots()]
+            return 200, _JSON, _json({"now": now(), "robots": robots})
+        if path == "/api/robot":
+            asked = parse_qs(query)
+            limits = {}
+            for name, given, most in (("events", _EVENTS, _MAX_EVENTS), ("maps", _MAPS, _MAX_MAPS)):
+                limits[name] = _number(asked, name, most, given)
+                if limits[name] is None:
+                    return 400, _JSON, _json({"error": f"{name} must be a number from 1 to {most}"})
+            robot = _named(asked)
+            row = self._store.robot(robot)
+            if row is None:
+                return 404, _JSON, _json({"error": "no such robot in the database"})
+            # One more of each than was asked for tells whether there are older ones.
+            events = self._store.events(robot, limits["events"] + 1)
+            maps = self._store.maps(robot, limits["maps"] + 1)
+            answer = {
+                "now": now(),
+                "robot": self._robot(row),
+                "events": events[: limits["events"]],
+                "more": len(events) > limits["events"],
+                "maps": maps[: limits["maps"]],
+                "more_maps": len(maps) > limits["maps"],
+            }
+            return 200, _JSON, _json(answer)
+        if path == "/api/map":
+            # A map is named by its number and its robot, as the robot's page lists it.
+            asked = parse_qs(query)
+            number = _number(asked, "id", _MAX_ID)
+            row = None if number is None else self._store.map(_named(asked), number)
+            if row is None:
+                return 404, _JSON, _json({"error": "no such map in the database"})
+            return 200, _JSON, _json({"map": row})
+        return 404, _TEXT, b"Not Found\n"
+
+    async def _command(self, query: str) -> tuple[int, str, bytes]:
+        """Send a robot the command the query names, and answer with what the robot said or why it said nothing."""
+        asked = parse_qs(query)
+        name = asked.get("command", [""])[0]
+        if name not in COMMANDS:
+            return 400, _JSON, _json({"error": f"command must be one of {', '.join(COMMANDS)}"})
+        # Whether the robot's last state said it would accept the command is not
+        # looked at: that state may be out of date, and the robot answers for itself.
+        return await self._call(_named(asked), *COMMANDS[name])
+
+    async def _schedule(self, query: str) -> tuple[int, str, bytes]:
+        """Ask a robot for its schedule or for a change to it, as the query says, and answer as for a command."""
+        asked = parse_qs(query)
+        try:
+            # The event comes as JSON in the query, so that here too no request body is read.
+            # It is checked whole before anything is sent: a robot may drop a body it cannot read without a word.
+            ability, params = scheduling(*(asked.get(key, [""])[0] for key in ("action", "id", "event")))
+        except ValueError as exc:
+            return 400, _JSON, _json({"error": str(exc)})
+        return await self._call(_named(asked), ability, params)
+
+    async def _rename(self, query: str) -> tuple[int, str, bytes]:
+        """Give a robot the name in the query, or take away the one it has when the query has none."""
+        asked = parse_qs(query)
+        try:
+            name = _name(asked)
+        except ValueError as exc:
+            return 400, _JSON, _json({"error": str(exc)})
+        robot = _named(asked)
+        # A name is the server's own, so the robot need not be connected. It has to be one
+        # the UI shows, though: a name for any other would be a row that nothing reads.
+        if self._store.robot(robot) is None:
+            return 404, _JSON, _json({"error": "no such robot in the database"})
+        if not self._store.save_name(robot, name):
+            return 503, _JSON, _json({"error": "the name could not be saved to the database"})
+        log.info("[%s] %s", robot, "goes by its serial again" if name is None else f"named {name!r}")
+        return 200, _JSON, _json({"name": name})
+
+    async def _delete(self, query: str) -> tuple[int, str, bytes]:
+        """Delete the robot the query names: all that the database holds of it, its key, and the session it has."""
+        robot = _named(parse_qs(query))
+        # As for a name, only a robot the UI shows: a key is not taken from one that nobody can see there.
+        if self._store.robot(robot) is None:
+            return 404, _JSON, _json({"error": "no such robot in the database"})
+        try:
+            deleted = await self._delete_robot(robot)
+        except OSError as exc:  # its key file is still there, and so is everything else of it
+            log.error("[%s] not deleted: its key could not be removed: %s", robot, describe(exc))
+            return 503, _JSON, _json({"error": f"the robot's key could not be deleted: {exc.strerror or exc}"})
+        if not deleted:
+            return 503, _JSON, _json({"error": "the robot could not be deleted from the database"})
+        log.info("[%s] deleted", robot)
+        return 200, _JSON, _json({})
+
+    async def _call(self, robot: RobotId, ability: str, params: dict) -> tuple[int, str, bytes]:
+        """Invoke an ability on a robot's live session, and answer with what the robot said or why it said nothing."""
+        session = self._sessions.get(robot)
+        if session is None:
+            return 409, _JSON, _json({"error": "the robot is not connected"})
+        sent = now()
+        try:
+            answer = await session.call(ability, params, timeout=_COMMAND_TIMEOUT)
+        except TimeoutError:
+            return 504, _JSON, _json({"error": f"the robot did not answer within {_COMMAND_TIMEOUT:g} s"})
+        except OSError as exc:  # the session ended first
+            return 502, _JSON, _json({"error": f"no answer from the robot: {describe(exc)}"})
+        try:
+            # The robot's code is given as it is, whatever it is: what the status says is that the robot answered.
+            # When the command was sent is for the page, which waits for a state that arrived after it.
+            told = {"ability": ability, "sent": sent, "code": answer.get("code"), "body": answer.get("body")}
+            return 200, _JSON, _json(told)
+        except ValueError:  # Python reads NaN and Infinity out of a frame, and JSON has neither
+            return 502, _JSON, _json({"error": "the robot's answer holds a number that JSON cannot carry"})
+
+    def _ca(self) -> str | None:
+        """The CA certificate robots must trust, as PEM text, or ``None`` when there is none to give.
+
+        It is ``ca.crt`` beside the server certificate, as ``certs.generate``
+        writes it. Read afresh each time, so a certificate regenerated while the
+        server runs is picked up, and only the certificate: never ``ca.key``.
+        """
+        try:
+            return self._config.cert.with_name("ca.crt").read_text()
+        except OSError:
+            return None
+
+    def _robot(self, row: dict[str, object]) -> dict[str, object]:
+        """A robot from the store as the API gives it: with its live session, or ``None`` when it has none."""
+        session = self._sessions.get(RobotId(row["vendor"], row["serial"]))
+        return {
+            **{name: _finite(value) for name, value in row.items()},
+            "session": session and {"address": session.ip, "firmware": session.firmware, "since": session.since},
+        }

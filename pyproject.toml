@@ -1,0 +1,20 @@
+[project]
+name = "deorbit"
+version = "0.1.0"
+description = "Clean-room server for the Orbital robot protocol"
+requires-python = ">=3.11"
+license = "GPL-3.0-only"
+dependencies = ["cryptography>=42", "pyyaml>=6"]
+
+[project.scripts]
+deorbit = "deorbit.__main__:main"
+
+[build-system]
+requires = ["setuptools>=77"]  # the first to take `license` as an SPDX expression
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["deorbit"]
+
+[tool.setuptools.package-data]
+deorbit = ["static/*"]  # the web UI's page, style, script and icon

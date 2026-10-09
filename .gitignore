@@ -1,0 +1,8 @@
+__pycache__/
+*.egg-info/
+.venv/
+# development CA and server keys from `python -m deorbit.certs`
+certs/
+# the database the server keeps
+data/
+mtp-fs.js
