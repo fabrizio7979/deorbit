@@ -1,14 +1,15 @@
+
 # Settings for the deorbit server. `python -m deorbit` reads this file from the
 # current directory; `python -m deorbit -c FILE` reads another one.
 #
 # Every setting is optional and is shown here at its default. Relative paths
 # start at the directory holding this file.
 
-host: 0.0.0.0             # IPv4 address to listen on
+host: 0.0.0.0
 port: 3443
 
-cert: certs/server.crt    # TLS certificate chain (PEM); see `python -m deorbit.certs`
-key: certs/server.key     # TLS private key (PEM)
+cert: certs/server.crt
+key: certs/server.key
 
 # Create a development CA and certificate at startup when `cert` and `key` are
 # both missing. Robots must then trust the `ca.crt` written beside `cert`.
@@ -20,37 +21,27 @@ generate_certs: true
 keys:
 
 # SQLite file holding each robot's last state, the time of its last heartbeat,
-# the log of its events, the maps it uploaded and the name it was given. The
-# file and its directory are created when missing.
+# the log of its events, the maps it uploaded and the name it was given.
 database: data/deorbit.db
 
-# Web page listing the robots in `database`, each with its events and maps, at
-# http://<this machine>:8080. It has no login: anyone who can reach the address
-# sees every robot and can send it commands. Set `web_host` to 127.0.0.1 to keep
-# it to this machine, or `web` to false.
+# Web interface
 web: true
-web_host: 0.0.0.0         # IPv4 address the web UI listens on
+web_host: 0.0.0.0
 web_port: 8080
 
-# Host or IP that robots on your network reach this server at. The web UI's
-# "Bind a robot" shows it and writes it into a robot's hosts file for
-# orbital.deorbit. Left empty, the server looks for this machine's address when
-# it starts and prints what it found; set it where that is not the one robots
-# reach, as in a container.
-public_address:
+# Address the robots use to reach this server on your LAN.
+public_address: 192.168.1.3
 
-# IANA time zone sent to robots at login, for example Europe/London.
-# Left empty, this machine's zone is used.
-timezone:
+# Time zone sent to robots at login.
+timezone: Europe/Rome
 
-heartbeat_interval: 30    # seconds; robots disconnect after 70 seconds of silence
-idle_timeout: 150         # seconds; drop a robot that has sent nothing for this long
-login_timeout: 30         # seconds a new connection has to send its login
-max_frame_size: 16777216  # bytes; drop a robot that sends a larger frame
+heartbeat_interval: 30
+idle_timeout: 150
+login_timeout: 30
+max_frame_size: 16777216
 
-# Seconds a login timestamp may differ from this machine's clock when `keys`
-# is set. 0 turns the check off, and replay protection with it.
+# Seconds a login timestamp may differ from this machine's clock when `keys` is set.
 max_clock_skew: 300
 
-full: false               # print signatures and map binaries in full
-verbose: false            # also print heartbeats
+full: false
+verbose: false
